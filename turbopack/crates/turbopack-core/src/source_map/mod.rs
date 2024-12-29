@@ -27,7 +27,7 @@ pub use source_map_asset::SourceMapAsset;
 static SOURCEMAP_CRATE_NONE_U32: u32 = !0;
 
 /// Allows callers to generate source maps.
-#[turbo_tasks::value_trait]
+#[turbo_tasks::value_trait(local)]
 pub trait GenerateSourceMap {
     /// Generates a usable source map, capable of both tracing and stringifying.
     fn generate_source_map(self: Vc<Self>) -> Vc<OptionSourceMap>;
@@ -501,9 +501,6 @@ impl SourceMap {
                         .to_resolved()
                         .await?;
                     sections.push(SourceMapSection::new(section.offset, map));
-                }
-                for section in &mut sections {
-                    section.map = section.map.to_resolved().await?;
                 }
                 SourceMap::new_sectioned(sections)
             }

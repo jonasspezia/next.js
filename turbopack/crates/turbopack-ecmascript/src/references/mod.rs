@@ -355,7 +355,7 @@ struct AnalysisState<'a> {
     url_rewrite_behavior: Option<UrlRewriteBehavior>,
 }
 
-impl<'a> AnalysisState<'a> {
+impl AnalysisState<'_> {
     /// Links a value to the graph, returning the linked value.
     async fn link_value(&self, value: JsValue, attributes: &ImportAttributes) -> Result<JsValue> {
         let fun_args_values = self.fun_args_values.lock().clone();
@@ -590,17 +590,15 @@ pub(crate) async fn analyse_ecmascript_module_internal(
         }
     }
 
-    let handler = Handler::with_emitter(
-        true,
-        false,
-        Box::new(IssueEmitter::new(source, source_map.clone(), None)),
-    );
+    let (emitter, collector) = IssueEmitter::new(source, source_map.clone(), None);
+    let handler = Handler::with_emitter(true, false, Box::new(emitter));
 
     let mut var_graph =
         set_handler_and_globals(&handler, globals, || create_graph(program, eval_context));
 
     let mut evaluation_references = Vec::new();
 
+    // ast-grep-ignore: to-resolved-in-loop
     for (i, r) in eval_context.imports.references().enumerate() {
         let r = EsmAssetReference::new(
             *origin,
@@ -776,7 +774,7 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                 path: source.ident().path().to_resolved().await?,
                 specified_type,
             }
-            .cell()
+            .resolved_cell()
             .emit();
         }
 
@@ -798,7 +796,7 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                     path: source.ident().path().to_resolved().await?,
                     specified_type,
                 }
-                .cell()
+                .resolved_cell()
                 .emit();
 
                 EcmascriptExports::EsmExports(
@@ -848,16 +846,16 @@ pub(crate) async fn analyse_ecmascript_module_internal(
         .resolved_cell();
         analysis.set_async_module(async_module);
     } else if let Some(span) = top_level_await_span {
-        AnalyzeIssue {
-            code: None,
-            message: StyledString::Text("top level await is only supported in ESM modules.".into())
-                .resolved_cell(),
-            source_ident: source.ident(),
-            severity: IssueSeverity::Error.resolved_cell(),
-            source: Some(issue_source(*source, span)),
-            title: ResolvedVc::cell("unexpected top level await".into()),
-        }
-        .cell()
+        AnalyzeIssue::new(
+            IssueSeverity::Error.cell(),
+            source.ident(),
+            Vc::cell("unexpected top level await".into()),
+            StyledString::Text("top level await is only supported in ESM modules.".into()).cell(),
+            None,
+            Some(issue_source(*source, span)),
+        )
+        .to_resolved()
+        .await?
         .emit();
     }
 
@@ -1256,6 +1254,8 @@ pub(crate) async fn analyse_ecmascript_module_internal(
 
     analysis.set_successful(true);
 
+    collector.emit().await?;
+
     analysis
         .build(matches!(
             options.tree_shaking_mode,
@@ -1408,7 +1408,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
             }
             JsValue::WellKnownFunction(WellKnownFunctionKind::WorkerConstructor) => {
                 let args = linked_args(args).await?;
-                if let [url @ JsValue::Url(_, JsValueUrlKind::Relative)] = &args[..] {
+                if let Some(url @ JsValue::Url(_, JsValueUrlKind::Relative)) = args.first() {
                     let pat = js_value_to_pattern(url);
                     if !pat.has_constant_parts() {
                         let (args, hints) = explain_args(&args);
@@ -1485,8 +1485,30 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
         }
         JsValue::WellKnownFunction(WellKnownFunctionKind::Import) => {
             let args = linked_args(args).await?;
-            if args.len() == 1 {
+            if args.len() == 1 || args.len() == 2 {
                 let pat = js_value_to_pattern(&args[0]);
+                let options = args.get(1);
+                let import_annotations = options
+                    .and_then(|options| {
+                        if let JsValue::Object { parts, .. } = options {
+                            parts.iter().find_map(|part| {
+                                if let ObjectPart::KeyValue(
+                                    JsValue::Constant(super::analyzer::ConstantValue::Str(key)),
+                                    value,
+                                ) = part
+                                {
+                                    if key.as_str() == "with" {
+                                        return Some(value);
+                                    }
+                                }
+                                None
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(ImportAnnotations::parse_dynamic)
+                    .unwrap_or_default();
                 if !pat.has_constant_parts() {
                     let (args, hints) = explain_args(&args);
                     handler.span_warn_with_code(
@@ -1509,6 +1531,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         Request::parse(Value::new(pat)),
                         Vc::cell(ast_path.to_vec()),
                         issue_source(*source, span),
+                        Value::new(import_annotations),
                         in_try,
                         state.import_externals,
                     )
@@ -3247,8 +3270,8 @@ fn detect_dynamic_export(p: &Program) -> DetectedDynamicExportType {
     if let Program::Module(m) = p {
         // Check for imports/exports
         if m.body.iter().any(|item| {
-            item.as_module_decl().map_or(false, |module_decl| {
-                module_decl.as_import().map_or(true, |import| {
+            item.as_module_decl().is_some_and(|module_decl| {
+                module_decl.as_import().is_none_or(|import| {
                     !is_turbopack_helper_import(import) && !is_swc_helper_import(import)
                 })
             })

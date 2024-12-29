@@ -185,11 +185,6 @@ impl ChunkItem for CssModuleChunkItem {
     }
 
     #[turbo_tasks::function]
-    fn references(&self) -> Vc<ModuleReferences> {
-        self.module.references()
-    }
-
-    #[turbo_tasks::function]
     fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>> {
         Vc::upcast(*self.chunking_context)
     }
@@ -233,7 +228,7 @@ impl CssChunkItem for CssModuleChunkItem {
                             Vc::try_resolve_downcast::<Box<dyn CssChunkItem>>(item).await?
                         {
                             imports.push(CssImport::Internal(
-                                import_ref.to_resolved().await?,
+                                import_ref,
                                 css_item.to_resolved().await?,
                             ));
                         }
